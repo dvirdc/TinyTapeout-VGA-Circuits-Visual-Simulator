@@ -34,6 +34,19 @@
                 <option value="circuit">circuit</option>
             </select>
         </div>
+        <div id="inputs_div">
+            <div><b>Inputs</b></div>
+            <div id="inputs_container"></div>
+        </div>
+        <div id="probes_div">
+            <div><b>Probes</b></div>
+            <div id="probes_container"></div>
+        </div>
+        <div id="outputs_div">
+            <div><b>Outputs</b></div>
+            <div id="outputs_container"></div>
+        </div>
+        <div id="extension_container"></div>
         <div>
             Circuit: 
             <select id="circuit_select" style="width: 150px;">
@@ -47,6 +60,7 @@
                 <option value="08_tt_um_top">Flame (K. Beckmann & L. Mårtensson)</option>
                 <option value="09_tt_um_vga_clock">VGA Clock (Matt Venn)</option>
                 <option value="09_tt_um_2048_vga_game">2048 Game (Uri Shaked)</option>
+                <option value="tt_um_sha256_processor_dvirdc">SHA-256 Processor (dvirdc)</option>
             </select>
             <span id="circuit_info"></span>
         </div>        
@@ -109,8 +123,17 @@
     const ca_project = '09_tt_um_znah_vga_ca';
     let sim;
     let project;
+    let configIndex = {};
+    let activeConfig = {};
+    const inputChangeTimers = {};
+    let extensionController = null;
+    let extScriptEl = null;
     async function init() {
         sim = await VGASimulator.init(glsl);
+        // Load global config index if present
+        try {
+            configIndex = await (await fetch('gds/config.json')).json();
+        } catch(e) { configIndex = {}; }
         await load_circuit();
         glsl.loop(frame);
     }
@@ -120,14 +143,25 @@
         $('#circuit_info').innerText = 'loading...';
         $('#phase').innerText = project==ca_project ? 'row 0: init' : '';
         $('#breakpoints_div').style.display = project==ca_project ? 'block' : 'none';
+        // Load sidecar project config if present
+        activeConfig = {};
+        try {
+            activeConfig = await (await fetch(`gds/${project}.config.json`)).json();
+        } catch(e) {
+            activeConfig = configIndex[project] || {};
+        }
         const url = `gds/${project}.bin`;
         const response = await fetch(url);
         const data = await response.arrayBuffer();
-        sim.load_circuit_bin(data);
+        sim.load_circuit_bin(data, activeConfig);
         const [tt, ...rest] = project.split('_');
         const name = rest.join('_');
         $('#circuit_info').innerHTML = `<a href="https://tinytapeout.com/runs/tt${tt}/${name}">project info</a>`;
         update_toggle_button();
+        renderInputsUI();
+        updateShowOptions();
+        await setupExtension();
+        renderOutputsUI();
     }
     $('#circuit_select').onchange = load_circuit;
 
@@ -140,6 +174,220 @@
         rotateIcon.style.display = rotateMode ? 'block' : 'none';
         moveIcon.style.display = rotateMode ? 'none' : 'block';
         toggleRotateBtn.title = rotateMode ? 'Rotate mode. Click to switch to move.' : 'Move mode. Click to switch to rotate.';
+    }
+
+    function renderInputsUI() {
+        const cont = $('#inputs_container');
+        cont.innerHTML = '';
+        const inputs = (activeConfig && activeConfig.inputPins) || [];
+        inputs.forEach(pinName => {
+            const id = `in_${pinName}`;
+            const wrapper = document.createElement('div');
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.id = id;
+            cb.onchange = () => sim.setInputPin(pinName, cb.checked);
+            wrapper.appendChild(cb);
+            const label = document.createElement('label');
+            label.htmlFor = id;
+            label.textContent = pinName;
+            wrapper.appendChild(label);
+            const dot = document.createElement('span');
+            dot.className = 'pin-dot';
+            dot.style.display = 'inline-block';
+            dot.style.width = '8px';
+            dot.style.height = '8px';
+            dot.style.marginLeft = '6px';
+            dot.style.borderRadius = '50%';
+            dot.dataset.pin = pinName;
+            dot.dataset.v = '-1';
+            wrapper.appendChild(dot);
+            cont.appendChild(wrapper);
+        });
+        $('#inputs_div').style.display = inputs.length ? 'block' : 'none';
+        $('#probes_div').style.display = (activeConfig && activeConfig.probes && activeConfig.probes.length) ? 'block' : 'none';
+    }
+
+    function renderOutputsUI() {
+        const cont = $('#outputs_container');
+        cont.innerHTML = '';
+        for (let i=0; i<8; i++) {
+            const name = `uo_out[${i}]`;
+            const wrapper = document.createElement('div');
+            const label = document.createElement('span');
+            label.textContent = name;
+            wrapper.appendChild(label);
+            const dot = document.createElement('span');
+            dot.className = 'out-dot';
+            dot.style.display = 'inline-block';
+            dot.style.width = '8px';
+            dot.style.height = '8px';
+            dot.style.marginLeft = '6px';
+            dot.style.borderRadius = '50%';
+            dot.dataset.pin = name;
+            dot.dataset.v = '-1';
+            wrapper.appendChild(dot);
+            cont.appendChild(wrapper);
+        }
+        $('#outputs_div').style.display = 'block';
+    }
+
+    function updateProbesUI() {
+        const cont = $('#probes_container');
+        const states = sim.getProbeStates();
+        cont.innerHTML = states.map(s => `${s.name}: ${s.value}`).join(' | ');
+        // update input dots
+        document.querySelectorAll('.pin-dot').forEach(el => {
+            const name = el.dataset.pin;
+            const v = sim.getPinValue(name);
+            if (v === null) { el.style.background = 'gray'; el.style.boxShadow='none'; return; }
+            // flash on change
+            const prev = parseInt(el.dataset.v, 10);
+            if (prev !== v) {
+                el.dataset.v = String(v);
+                inputChangeTimers[name] = 6; // frames to flash
+            }
+            const t = inputChangeTimers[name] || 0;
+            if (t > 0) {
+                inputChangeTimers[name] = t - 1;
+                el.style.background = v ? '#ff0' : '#663';
+                el.style.boxShadow = '0 0 8px #ff0';
+            } else {
+                el.style.background = v ? '#0f0' : '#222';
+                el.style.boxShadow = v ? '0 0 6px #0f0' : 'none';
+            }
+        });
+        // update output dots
+        document.querySelectorAll('.out-dot').forEach(el => {
+            const name = el.dataset.pin;
+            const v = sim.getPinValue(name);
+            if (v === null) { el.style.background = 'gray'; el.style.boxShadow='none'; return; }
+            const prev = parseInt(el.dataset.v, 10);
+            if (prev !== v) {
+                el.dataset.v = String(v);
+                inputChangeTimers[name] = 6;
+            }
+            const t = inputChangeTimers[name] || 0;
+            if (t > 0) {
+                inputChangeTimers[name] = t - 1;
+                el.style.background = v ? '#0ff' : '#066';
+                el.style.boxShadow = '0 0 8px #0ff';
+            } else {
+                el.style.background = v ? '#09f' : '#222';
+                el.style.boxShadow = v ? '0 0 6px #09f' : 'none';
+            }
+        });
+    }
+
+    function updateShowOptions() {
+        const vis = (activeConfig && activeConfig.visualization) || 'generic';
+        const sel = $('#show_select');
+        [...sel.options].forEach(o => o.disabled = false);
+        if (vis !== 'vga') {
+            // generic circuits cannot render a screen
+            sel.value = 'circuit';
+            sel.querySelector('option[value="screen"]').disabled = true;
+            sel.querySelector('option[value="circuit+screen"]').disabled = true;
+        }
+    }
+
+    async function setupExtension() {
+        const container = document.getElementById('extension_container');
+        container.innerHTML = '';
+        extensionController = null;
+        // remove previous project extension script if any
+        if (extScriptEl) {
+            extScriptEl.remove();
+            extScriptEl = null;
+        }
+        // clear any previous registered extension
+        try { delete window.ProjectExtension; } catch(e) {}
+        const name = (project||'').trim();
+        // attempt to load optional per-project extension: gds/<project>.ext.js
+        const src = `gds/${name}.ext.js`;
+        const exists = await fetch(src, {method:'HEAD'}).then(r=>r.ok).catch(()=>false);
+        if (!exists) return; // optional
+        await new Promise((resolve, reject)=>{
+            const s = document.createElement('script');
+            s.id = 'project_ext_script';
+            s.src = src;
+            s.onload = resolve;
+            s.onerror = reject;
+            document.body.appendChild(s);
+            extScriptEl = s;
+        }).catch(()=>{});
+        if (!window.ProjectExtension) return;
+        extensionController = window.ProjectExtension.create({
+            sim,
+            project: name,
+            config: activeConfig,
+            container,
+            getProbes: () => sim.getProbeStates(),
+            getPin: (n) => sim.getPinValue(n),
+            setPin: (n,v) => sim.setInputPin(n,v)
+        });
+    }
+
+    function makeDummyBytes() {
+        const text = 'Hello TinyTapeout! '; // 20 chars
+        const arr = [];
+        for (let r=0; r<8; r++) {
+            for (let i=0; i<text.length; i++) arr.push(text.charCodeAt(i) & 0xFF);
+        }
+        return arr;
+    }
+
+    function setByteToPins(byte) {
+        for (let i=0; i<8; i++) {
+            const v = (byte>>i)&1;
+            sim.setInputPin(`ui_in[${i}]`, v);
+        }
+    }
+
+    function feedStep() {
+        if (!feeder.active) return;
+        if (feeder.index >= feeder.data.length) {
+            // done
+            sim.setInputPin('VALID_IN', 0);
+            sim.setInputPin('LAST_IN', 0);
+            feeder.active = false;
+            feeder.done = true;
+            $('#feeder_toggle').textContent = 'Reset feed';
+            $('#feed_status').textContent = 'Done';
+            return;
+        }
+        if (feeder.cooldown > 0) { feeder.cooldown--; return; }
+        // optional handshake: wait for READY_OUT==1 if present
+        let ready = true;
+        const states = sim.getProbeStates();
+        const st = states.find(s=>s.name==='READY_OUT') || states.find(s=>s.name==='uio_out[4]');
+        if (st) ready = !!st.value;
+        if (!ready) return;
+        const b = feeder.data[feeder.index];
+        setByteToPins(b);
+        const last = feeder.index === feeder.data.length-1 ? 1 : 0;
+        ;['VALID_IN','uio_in[0]'].forEach(n=>sim.setInputPin(n,1));
+        ;['LAST_IN','uio_in[1]'].forEach(n=>sim.setInputPin(n,last));
+        const ch = (b>=32 && b<127) ? String.fromCharCode(b) : '.';
+        $('#feed_status').textContent = `idx ${feeder.index}/${feeder.data.length}  byte 0x${b.toString(16).padStart(2,'0')} '${ch}'`;
+        feeder.index++;
+        // hold each byte for visibility
+        feeder.cooldown = 8;
+    }
+
+    function resetFeeder() {
+        // Clear inputs
+        for (let i=0; i<8; i++) sim.setInputPin(`ui_in[${i}]`, 0);
+        ['VALID_IN','uio_in[0]','LAST_IN','uio_in[1]'].forEach(n=>sim.setInputPin(n,0));
+        // Pulse reset if available
+        sim.setInputPin('rst_n', 0);
+        sim.setInputPin('rst_n', 1);
+        feeder.index = 0;
+        feeder.cooldown = 0;
+        feeder.done = false;
+        $('#feed_status').textContent = '';
+        // Clear input dot state to force change flash
+        document.querySelectorAll('.pin-dot').forEach(el => el.dataset.v = '-1');
     }
 
     const zoomInBtn = $('#zoom_in');
@@ -187,6 +435,7 @@
         $('#speed_display').textContent = '2^'+speed;
         const step_n = Math.pow(2, speed);
         sim.multistep(step_n, updateStatus);
+        if (extensionController && extensionController.onFrame) extensionController.onFrame();
 
         //sim.view.pan += 0.001;
 
@@ -199,6 +448,7 @@
             sim.draw_circuit(step_n);
             sim.draw_screen(step_n, false);
         }
+        updateProbesUI();
     }
 
     init();

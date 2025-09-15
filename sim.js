@@ -58,10 +58,24 @@ const VGA_SCREEN_W = 800;
 const VGA_SCREEN_H = 525;
 const VGA_ASPECT = VGA_SCREEN_W / VGA_SCREEN_H;
 
-class VGASimulator {
+class CircuitSimulator {
     static async init(glsl) {
-        const wasm = await WebAssembly.instantiateStreaming(fetch('gates.wasm'));
-        return new VGASimulator(glsl, wasm);
+        let wasm;
+        try {
+            const res = await fetch('gates.wasm');
+            const ct = (res.headers.get('Content-Type')||'').toLowerCase();
+            if (ct.includes('application/wasm')) {
+                wasm = await WebAssembly.instantiateStreaming(Promise.resolve(res));
+            } else {
+                const buf = await res.arrayBuffer();
+                wasm = await WebAssembly.instantiate(buf);
+            }
+        } catch (e) {
+            const res = await fetch('gates.wasm');
+            const buf = await res.arrayBuffer();
+            wasm = await WebAssembly.instantiate(buf);
+        }
+        return new CircuitSimulator(glsl, wasm);
     }
 
     constructor(glsl, wasm) {
@@ -74,9 +88,11 @@ class VGASimulator {
         this.min_steps_per_tick = 16;
 
         this.setupControls(glsl.gl.canvas);
+        this.config = {visualization:'generic', pins:{clock:'clk', reset_n:'rst_n', enable:'ena'}};
+        this.probes = [];
     }
 
-    load_circuit_bin(buf) {
+    load_circuit_bin(buf, config={}) {
         const bytes = new Uint8Array(buf);
         const jsonLength = bytes.indexOf(0);
         const data = JSON.parse(new TextDecoder().decode(bytes.slice(0, jsonLength)));
@@ -109,8 +125,39 @@ class VGASimulator {
             rects: array2tex(glsl, data.wire_rects.a, 'rgba16u', 'rects'),
             infos: array2tex(glsl, data.wire_infos.a, 'rg16u', 'infos'),
         };
-        const out_pins = range(8).map(i=>`uo_out[${i}]`)
-        this.out_wires = out_pins.map(pin=>this.pin2wire[pin]);
+        // Load configuration
+        this.config = Object.assign({visualization:'generic', pins:{}}, config||{});
+        const pinsCfg = this.config.pins||{};
+        this.controlPins = {
+            clock: pinsCfg.clock || 'clk',
+            reset_n: pinsCfg.reset_n || 'rst_n',
+            enable: pinsCfg.enable || 'ena'
+        };
+        this.probes = Array.isArray(this.config.probes) ? this.config.probes.slice(0, 16) : [];
+
+        // VGA mapping (optional)
+        this.renderer = (this.config.visualization||'generic');
+        if (this.renderer === 'vga') {
+            const vga = this.config.vga || {};
+            const defaultOutPins = range(8).map(i=>`uo_out[${i}]`);
+            // Default TinyTapeout VGA mapping
+            const mapping = {
+                r1: vga.r1 || defaultOutPins[0],
+                g1: vga.g1 || defaultOutPins[1],
+                b1: vga.b1 || defaultOutPins[2],
+                vsync: vga.vsync || defaultOutPins[3],
+                r0: vga.r0 || defaultOutPins[4],
+                g0: vga.g0 || defaultOutPins[5],
+                b0: vga.b0 || defaultOutPins[6],
+                hsync: vga.hsync || defaultOutPins[7],
+            };
+            this.vga_wires = {};
+            for (const k in mapping) {
+                const pinName = mapping[k];
+                this.vga_wires[k] = this.pin2wire[pinName];
+            }
+        }
+
         this.main.gate_n[0] = data.luts.shape[0];
         for (const name of ['luts', 'inputs_start', 'inputs', 'outputs_start', 'outputs']) {
             this.main[name].set(data[name].a);
@@ -130,7 +177,17 @@ class VGASimulator {
 
         this.screen_row.fill(0);
         this.main.state.fill(0);
-        this.main.state[this.pin2wire['ui_in[7]']] = 1;
+        // Apply defaults: enable, custom inputs
+        if (this.controlPins.enable && (this.controlPins.enable in this.pin2wire)) {
+            this.main.state[this.pin2wire[this.controlPins.enable]] = 1;
+        }
+        if (this.config.inputs) {
+            for (const pin in this.config.inputs) {
+                if (pin in this.pin2wire) {
+                    this.main.state[this.pin2wire[pin]] = this.config.inputs[pin] ? 1 : 0;
+                }
+            }
+        }
         let c=0;
         while (c=this.main.update_all()){ console.log(c)};
         this.updateState();
@@ -153,14 +210,12 @@ class VGASimulator {
 
     step(rowCallback=()=>{}) {
         const {main, tick, pin2wire, screen_row} = this;
+        const clk_pin = this.controlPins.clock;
+        const rst_pin = this.controlPins.reset_n;
         const clk = tick&1;
-        const rst_n = (tick>9) & 1; // ???
-        const [R1, G1, B1, vsync, R0, G0, B0, hsync] = this.out_wires;
-        const S = main.state;
-        const prev_hsync = S[hsync];
-        const prev_vsync = S[vsync];
-        main.set_signal(pin2wire.clk, clk);
-        main.set_signal(pin2wire.rst_n, rst_n);
+        const rst_n = (tick>9) & 1;
+        if (clk_pin && (clk_pin in pin2wire)) main.set_signal(pin2wire[clk_pin], clk);
+        if (rst_pin && (rst_pin in pin2wire)) main.set_signal(pin2wire[rst_pin], rst_n);
         const cycleDone = (main.run_wave()==0) && (this.steps_till_tick <= 0);
         this.steps_till_tick -= 1;
         if (cycleDone) {
@@ -168,14 +223,23 @@ class VGASimulator {
             this.steps_till_tick = this.min_steps_per_tick;
         }
 
+        if (this.renderer !== 'vga') {
+            return cycleDone;
+        }
+
+        const S = main.state;
+        const {r1,g1,b1,r0,g0,b0,hsync,vsync} = this.vga_wires;
+        const prev_hsync = S[hsync];
+        const prev_vsync = S[vsync];
+
         let [x, y] = this.rayXY;
         const W = screen_row.length / 4;
         if (cycleDone && clk == 1) {
             if (x<W) {
                 const p = x*4;
-                screen_row[p+0] = S[R1]*170 + S[R0]*85;
-                screen_row[p+1] = S[G1]*170 + S[G0]*85;
-                screen_row[p+2] = S[B1]*170 + S[B0]*85;
+                screen_row[p+0] = S[r1]*170 + S[r0]*85;
+                screen_row[p+1] = S[g1]*170 + S[g0]*85;
+                screen_row[p+2] = S[b1]*170 + S[b0]*85;
             }
             x += 1;
         }
@@ -276,19 +340,22 @@ class VGASimulator {
         }
         float vmax(vec3 p) { return max(p.x, max(p.y, p.z));}`};
         
-        // draw clock
-        const clkPos = this.pin_pos['clk'];
-        const clkWire = this.pin2wire['clk'];
-        glsl({DepthTest:1, ...view, time, clkPos, clkWire, state:smoothState[0],
-            Grid:[6,1], Blend:'s*sa+d*(1-sa)', Face:'front', VP:`
-            WireStyle ws = wireStyle(int(clkWire));
-            varying vec4 color = ws.color;
-            VPos.xyz = cubeVert(XY, ID.x)*(1.0+vec3(-ws.expand,ws.expand*3.,-ws.expand));
-            VPos.xyz += vec3(clkPos, wireHeight*4.0) + vec3(0.0,2.0+float(ID.y),0.0); 
-            VPos = applyView(VPos);
-        `, FP:`
-        float a = 0.8+0.2*vignette(UV);
-        FOut = color*a;`});
+        // draw clock (if available)
+        const clkName = this.controlPins.clock;
+        if (clkName && (clkName in this.pin_pos) && (clkName in this.pin2wire)) {
+            const clkPos = this.pin_pos[clkName];
+            const clkWire = this.pin2wire[clkName];
+            glsl({DepthTest:1, ...view, time, clkPos, clkWire, state:smoothState[0],
+                Grid:[6,1], Blend:'s*sa+d*(1-sa)', Face:'front', VP:`
+                WireStyle ws = wireStyle(int(clkWire));
+                varying vec4 color = ws.color;
+                VPos.xyz = cubeVert(XY, ID.x)*(1.0+vec3(-ws.expand,ws.expand*3.,-ws.expand));
+                VPos.xyz += vec3(clkPos, wireHeight*4.0) + vec3(0.0,2.0+float(ID.y),0.0); 
+                VPos = applyView(VPos);
+            `, FP:`
+            float a = 0.8+0.2*vignette(UV);
+            FOut = color*a;`});
+        }
 
         // draw gates
         const flipLayers = Math.cos(view.tilt) < -0.01;
@@ -360,6 +427,7 @@ class VGASimulator {
 
     draw_screen(speed=1, fullsreen=false) {
         const {glsl, rayXY, screen} = this;
+        if (this.renderer !== 'vga') return;
 
         // const inc= `
         // const vec2 justify = vec2(0.0, 1.0);
@@ -404,6 +472,28 @@ class VGASimulator {
             }
             FOut.rgb += exp(-dot(dray,dray))*vec3(1.,1.,0.3);
             `});
+    }
+
+    getProbeStates() {
+        const S = this.main.state;
+        const res = [];
+        for (const name of this.probes) {
+            if (name in this.pin2wire) {
+                res.push({name, value:S[this.pin2wire[name]]|0});
+            }
+        }
+        return res;
+    }
+
+    setInputPin(name, value) {
+        if (!(name in this.pin2wire)) return;
+        this.main.set_signal(this.pin2wire[name], value?1:0);
+        this.updateState();
+    }
+
+    getPinValue(name) {
+        if (!(name in this.pin2wire)) return null;
+        return this.main.state[this.pin2wire[name]]|0;
     }
 
     _handleMove(dx, dy, isRotate) {
@@ -455,3 +545,6 @@ class VGASimulator {
     }
 
 }
+
+// Backward compatibility for intro.html and other legacy pages
+const VGASimulator = CircuitSimulator;
