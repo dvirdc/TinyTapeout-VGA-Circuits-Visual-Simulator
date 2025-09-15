@@ -1,0 +1,45 @@
+{
+  "09_tt_um_znah_vga_ca": {
+    "visualization": "vga",
+    "pins": {"clock": "clk", "reset_n": "rst_n", "enable": "ena"},
+    "vga": {
+      "r1": "uo_out[0]", "g1": "uo_out[1]", "b1": "uo_out[2]",
+      "vsync": "uo_out[3]", "r0": "uo_out[4]", "g0": "uo_out[5]",
+      "b0": "uo_out[6]", "hsync": "uo_out[7]"
+    },
+    "inputPins": ["ui_in[7]"]
+  },
+  "05_tt_um_dinogame": {
+    "visualization": "vga",
+    "pins": {"clock": "clk", "reset_n": "rst_n", "enable": "ena"}
+  },
+  "07_tt_um_algofoogle_raybox_zero": {
+    "visualization": "vga",
+    "pins": {"clock": "clk", "reset_n": "rst_n", "enable": "ena"}
+  },
+  "08_tt_um_a1k0n_vgadonut": {
+    "visualization": "vga",
+    "pins": {"clock": "clk", "reset_n": "rst_n", "enable": "ena"}
+  },
+  "08_tt_um_a1k0n_nyancat": {
+    "visualization": "vga",
+    "pins": {"clock": "clk", "reset_n": "rst_n", "enable": "ena"}
+  },
+  "09_tt_um_rejunity_vga_test01": {
+    "visualization": "vga",
+    "pins": {"clock": "clk", "reset_n": "rst_n", "enable": "ena"}
+  },
+  "08_tt_um_top": {
+    "visualization": "vga",
+    "pins": {"clock": "clk", "reset_n": "rst_n", "enable": "ena"}
+  },
+  "09_tt_um_vga_clock": {
+    "visualization": "vga",
+    "pins": {"clock": "clk", "reset_n": "rst_n", "enable": "ena"}
+  },
+  "09_tt_um_2048_vga_game": {
+    "visualization": "vga",
+    "pins": {"clock": "clk", "reset_n": "rst_n", "enable": "ena"}
+  }
+}
+
