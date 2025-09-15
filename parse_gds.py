@@ -8,10 +8,12 @@ from IPython.display import HTML, display, SVG
 import requests
 import io
 from pathlib import Path
+import argparse
+import sys
 from collections import Counter, defaultdict
 from collections import namedtuple
 import base64
-from typing import Any
+from typing import Any, Dict, Set, Tuple, Union
 from graphviz import Digraph
 import json
 
@@ -77,7 +79,9 @@ class DisjointSets:
         root_a, root_b = self.get_root(a), self.get_root(b)
         self.nodes[root_b] = root_a
 
-    def label_components(self, known_ids: dict[Any, int]={}):
+    def label_components(self, known_ids=None):
+        if known_ids is None:
+            known_ids = {}
         node2id = {self.get_root(node): i for node, i in known_ids.items()}
         next_id = max(list(node2id.values()) + [-1]) + 1
         id2nodes = {}
@@ -93,8 +97,8 @@ class DisjointSets:
 
 Part = namedtuple('Part', 'layer idx')
 FET = namedtuple('FET', 'type gate a b')
-LayerKey = str | tuple[int,int]
-Layers = dict[LayerKey, STRtree]
+LayerKey = Union[str, Tuple[int,int]]
+Layers = Dict[LayerKey, STRtree]
 
 def extract_layers(cell : gdspy.Cell) -> Layers:
     layers = {}
@@ -139,7 +143,7 @@ def connect_layers(layers: Layers) -> DisjointSets:
     return parts
 
 
-def find_pins(layers: Layers, gds_cell: gdspy.Cell) -> dict[str, Part]:
+def find_pins(layers: Layers, gds_cell: gdspy.Cell) -> Dict[str, Part]:
     pin2part = {}
     for lab in gds_cell.get_labels(depth=0):
         if lab.text in ['VNB', 'VPB']:
@@ -156,7 +160,7 @@ def find_pins(layers: Layers, gds_cell: gdspy.Cell) -> dict[str, Part]:
         pin2part[lab.text] = Part(layer, int(node[0]))
     return pin2part
 
-def extract_fets(part2wire: dict[Part,int], layers: Layers) -> set[FET]:
+def extract_fets(part2wire: Dict[Part,int], layers: Layers) -> Set[FET]:
     fets = set()
     if 'channel' not in layers:
         return fets
@@ -238,8 +242,8 @@ def classify_wires(fets, wires2fets):
             'out':out_wires, 'gate':wires['G']}
 
 
-def build_signals(wire2fets: dict[int, set[FET]],
-                  inputs: set[int], to_resolve: set[int]):
+def build_signals(wire2fets: Dict[int, Set[FET]],
+                  inputs: Set[int], to_resolve: Set[int]):
     '''
     return: 
         resolved: bool
@@ -437,7 +441,7 @@ def export_wires(top_cell):
             wire_infos.append([wire, z])
     return wire_rects, wire_infos
 
-def export_circuit(top_cell, out_fn):
+def export_circuit(top_cell, out_path):
     wire_rects, wire_infos = export_wires(top_cell)
 
     gate_luts, gate_inputs, gate_outputs = {}, {}, {}
@@ -520,10 +524,11 @@ def export_circuit(top_cell, out_fn):
 
     pin_names, pin_wires, pin_pos = [], [], []
     for lab in top_cell.gds_cell.get_labels(depth=0):
-        if not (lab.text in ['clk', 'rst_n', 'ena'] or lab.text[0]=='u'):
+        # Export all labeled pins except known power rails
+        if lab.text in power_pins:
             continue
         wire = top_cell.pin2wire.get(lab.text)
-        if not wire:
+        if wire is None:
             continue
         pin_names.append(lab.text)
         pin_wires.append(wire)
@@ -536,7 +541,10 @@ def export_circuit(top_cell, out_fn):
     print(meta_json)
     assert len(meta_json) < meta_reserved
 
-    with open(out_fn.with_suffix('.bin'), 'wb') as f:
+    out_path = Path(out_path)
+    if out_path.suffix != '.bin':
+        out_path = out_path.with_suffix('.bin')
+    with open(out_path, 'wb') as f:
         f.write(meta_json)
         f.seek(meta_reserved)
         for ofs, a in export_arrays:
@@ -566,8 +574,8 @@ def fetch_gds(project, cache_dir=Path('gds')):
     tmp_path.rename(cache_path)
     return cache_path
 
-pdk_root = '/Users/moralex/ttsetup/pdk/volare/sky130/versions/bdc9412b3e468c102d01b7cf6337be06ec6e9c9a/'
-pdk_gds = pdk_root+'sky130A/libs.ref/sky130_fd_sc_hd/gds/sky130_fd_sc_hd.gds'
+#pdk_root = '/Users/moralex/ttsetup/pdk/volare/sky130/versions/bdc9412b3e468c102d01b7cf6337be06ec6e9c9a/'
+#pdk_gds = pdk_root+'sky130A/libs.ref/sky130_fd_sc_hd/gds/sky130_fd_sc_hd.gds'
 
 projects = [
     '05_tt_um_dinogame',
@@ -590,19 +598,43 @@ projects = [
 
 
 if __name__ == '__main__':
-    gds = gdspy.GdsLibrary().read_gds('gds/ihp/tt_um_znah_vga_ca.gds')
+    parser = argparse.ArgumentParser(description='Convert a GDS file into a simulator .bin asset')
+    parser.add_argument('gds', help='Path to input GDS file')
+    parser.add_argument('-o', '--out', help='Output .bin path (default: input with .bin)')
+    parser.add_argument('--top', help='Top cell name to export (default: first top-level)')
+    parser.add_argument('--list-top', action='store_true', help='List top-level cell names and exit')
+    args = parser.parse_args()
+
+    gds_path = Path(args.gds)
+    if not gds_path.exists():
+        print(f'Input GDS not found: {gds_path}', file=sys.stderr)
+        sys.exit(1)
+
+    print(f'Reading {gds_path} ...')
+    gds = gdspy.GdsLibrary().read_gds(str(gds_path))
+    top_cells = gds.top_level()
+    if args.list_top:
+        print('Top-level cells:')
+        for c in top_cells:
+            print(' -', c.name)
+        sys.exit(0)
+
+    if args.top:
+        if args.top not in gds.cells:
+            print(f'Top cell not found: {args.top}', file=sys.stderr)
+            sys.exit(2)
+        top_gds_cell = gds.cells[args.top]
+    else:
+        if not top_cells:
+            print('No top-level cells found in GDS', file=sys.stderr)
+            sys.exit(3)
+        top_gds_cell = top_cells[0]
+
+    print('Analyzing cells ...')
     cells = analyse_cells(gds)
     print('Top cell analysis ...')
-    top_cell = Cell(gds.top_level()[0], cells)
+    top_cell = Cell(top_gds_cell, cells)
     print('Export ...')
-    export_circuit(top_cell, 'ihp.json')
-
-    # for project in projects[:1]:
-    #     gds_fn = fetch_gds(project)
-    #     print(f'processing {gds_fn}...')
-    #     gds = gdspy.GdsLibrary().read_gds(gds_fn)
-    #     cells = analyse_cells(gds)
-    #     print('Top cell analysis ...')
-    #     top_cell = Cell(gds.top_level()[0], cells)
-    #     print('Export ...')
-    #     export_circuit(top_cell, gds_fn.with_suffix('.json'))
+    out_path = Path(args.out) if args.out else gds_path.with_suffix('.bin')
+    export_circuit(top_cell, out_path)
+    print(f'Wrote {Path(out_path).with_suffix(".bin")}')
