@@ -1,0 +1,8 @@
+numpy
+gdspy
+shapely
+drawsvg
+graphviz
+requests
+ipython
+
